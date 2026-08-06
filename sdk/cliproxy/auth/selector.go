@@ -269,6 +269,14 @@ func collectAvailableByPriority(auths []*Auth, model string, now time.Time) (ava
 }
 
 func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]*Auth, error) {
+	return getAvailableAuthsWithPriorityMode(auths, provider, model, now, false)
+}
+
+func getAvailableAuthsAcrossPriorities(auths []*Auth, provider, model string, now time.Time) ([]*Auth, error) {
+	return getAvailableAuthsWithPriorityMode(auths, provider, model, now, true)
+}
+
+func getAvailableAuthsWithPriorityMode(auths []*Auth, provider, model string, now time.Time, allPriorities bool) ([]*Auth, error) {
 	if len(auths) == 0 {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
 	}
@@ -289,20 +297,30 @@ func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]
 		return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
 	}
 
-	bestPriority := 0
-	found := false
-	for priority := range availableByPriority {
-		if !found || priority > bestPriority {
-			bestPriority = priority
-			found = true
-		}
-	}
+	return availableAuthsFromPriorityBuckets(availableByPriority, allPriorities), nil
+}
 
-	available := availableByPriority[bestPriority]
+func availableAuthsFromPriorityBuckets(availableByPriority map[int][]*Auth, allPriorities bool) []*Auth {
+	available := make([]*Auth, 0)
+	if allPriorities {
+		for _, candidates := range availableByPriority {
+			available = append(available, candidates...)
+		}
+	} else {
+		bestPriority := 0
+		found := false
+		for priority := range availableByPriority {
+			if !found || priority > bestPriority {
+				bestPriority = priority
+				found = true
+			}
+		}
+		available = append(available, availableByPriority[bestPriority]...)
+	}
 	if len(available) > 1 {
 		sort.Slice(available, func(i, j int) bool { return available[i].ID < available[j].ID })
 	}
-	return available, nil
+	return available
 }
 
 // Pick selects the next available auth for the provider in a round-robin manner.
@@ -573,17 +591,21 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	entry := selectorLogEntry(ctx)
 	primaryID, fallbackID := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
-	if primaryID == "" {
-		entry.Debugf("session-affinity: no session ID extracted, falling back to default selector | provider=%s model=%s", provider, model)
-		return s.fallback.Pick(ctx, provider, model, opts, auths)
-	}
-
 	now := time.Now()
 	availabilityCandidates := auths
 	if _, weighted := s.fallback.(*WeightedRoundRobinSelector); weighted {
 		availabilityCandidates = positiveWeightAuths(auths)
 	}
-	available, err := getAvailableAuths(availabilityCandidates, provider, model, now)
+	fallbackAuths, err := getAvailableAuths(availabilityCandidates, provider, model, now)
+	if err != nil {
+		return nil, err
+	}
+	if primaryID == "" {
+		entry.Debugf("session-affinity: no session ID extracted, falling back to default selector | provider=%s model=%s", provider, model)
+		return s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
+	}
+
+	available, err := getAvailableAuthsAcrossPriorities(availabilityCandidates, provider, model, now)
 	if err != nil {
 		return nil, err
 	}
@@ -610,7 +632,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			}
 		}
 		// Cached auth not available, reselect via fallback selector for even distribution
-		auth, err := s.fallback.Pick(ctx, provider, model, opts, auths)
+		auth, err := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
 		if err != nil {
 			return nil, err
 		}
@@ -631,7 +653,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		}
 	}
 
-	auth, err := s.fallback.Pick(ctx, provider, model, opts, auths)
+	auth, err := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
 	if err != nil {
 		return nil, err
 	}
