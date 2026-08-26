@@ -1,17 +1,22 @@
 package live
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executionregistry"
 )
 
 func TestHandleDirectWebsocketRejectsClientSecretModelMismatch(t *testing.T) {
@@ -30,6 +35,49 @@ func TestHandleDirectWebsocketRejectsClientSecretModelMismatch(t *testing.T) {
 	router.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusForbidden, recorder.Body.String())
+	}
+}
+
+func TestHandleDirectWebsocketHomeRefreshFailurePreservesUpstreamUnauthorized(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const upstreamBody = `{"error":{"message":"upstream websocket token expired","type":"authentication_error"}}`
+	var upstreamCalls atomic.Int32
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		upstreamCalls.Add(1)
+		writer.Header().Set("Content-Type", "application/json")
+		writer.Header().Set("X-Request-Id", "upstream-request-id")
+		writer.WriteHeader(http.StatusUnauthorized)
+		_, _ = writer.Write([]byte(upstreamBody))
+	}))
+	defer upstreamServer.Close()
+
+	manager := auth.NewManager(nil, nil, nil)
+	manager.SetConfig(&config.Config{Home: config.HomeConfig{Enabled: true}})
+	registry := executionregistry.New()
+	manager.PublishHomeDispatch(&homeDispatcher{}, registry, 1)
+	executor := &captureExecutor{refreshErr: errors.New("credential refresh temporarily unavailable")}
+	manager.RegisterExecutor(executor)
+	handler := NewHandler(manager, nil)
+	handler.sidebandAPIBaseURL = "ws" + strings.TrimPrefix(upstreamServer.URL, "http") + "/v1"
+	router := gin.New()
+	router.GET("/v1/realtime", handler.HandleRealtimeWebsocket)
+	request := httptest.NewRequest(http.MethodGet, "/v1/realtime?model=gpt-realtime", nil)
+	request.Header.Set("Connection", "Upgrade")
+	request.Header.Set("Upgrade", "websocket")
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusUnauthorized || recorder.Body.String() != upstreamBody {
+		t.Fatalf("response = %d %s, want original upstream 401 body", recorder.Code, recorder.Body.String())
+	}
+	if recorder.Header().Get("X-Request-Id") != "upstream-request-id" {
+		t.Fatalf("X-Request-Id = %q, want upstream request ID", recorder.Header().Get("X-Request-Id"))
+	}
+	if executor.refreshCalls.Load() != 1 || upstreamCalls.Load() != 1 {
+		t.Fatalf("refresh/upstream calls = %d/%d, want 1/1", executor.refreshCalls.Load(), upstreamCalls.Load())
+	}
+	if errDrain := registry.Drain(context.Background()); errDrain != nil {
+		t.Fatalf("Drain() error = %v", errDrain)
 	}
 }
 

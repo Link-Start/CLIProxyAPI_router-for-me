@@ -37,6 +37,7 @@ type codexSearchCaptureExecutor struct {
 	authIDs      []string
 	prepareErr   error
 	httpErr      error
+	refreshErr   error
 	responseBody io.ReadCloser
 	statuses     []int
 	refreshCalls int
@@ -55,6 +56,9 @@ func (e *codexSearchCaptureExecutor) ExecuteStream(context.Context, *auth.Auth, 
 
 func (e *codexSearchCaptureExecutor) Refresh(_ context.Context, a *auth.Auth) (*auth.Auth, error) {
 	e.refreshCalls++
+	if e.refreshErr != nil {
+		return nil, e.refreshErr
+	}
 	updated := a.Clone()
 	if updated.Metadata == nil {
 		updated.Metadata = make(map[string]any)
@@ -348,6 +352,32 @@ func TestHomeCodexAlphaSearchRefreshesUnauthorizedSelectionOnce(t *testing.T) {
 	}
 	if got := dispatcher.calls.Load(); got != 1 {
 		t.Fatalf("Home RPOP calls = %d, want 1", got)
+	}
+}
+
+func TestHomeCodexAlphaSearchRefreshFailurePreservesUpstreamUnauthorized(t *testing.T) {
+	server := newTestServer(t)
+	dispatcher := &codexSearchHomeDispatcher{}
+	server.handlers.AuthManager.SetConfig(&proxyconfig.Config{Home: proxyconfig.HomeConfig{Enabled: true}})
+	server.handlers.AuthManager.PublishHomeDispatch(dispatcher, executionregistry.New(), 1)
+	const upstreamBody = `{"error":{"message":"upstream access token expired","type":"authentication_error"}}`
+	executor := &codexSearchCaptureExecutor{
+		statuses:     []int{http.StatusUnauthorized},
+		responseBody: io.NopCloser(strings.NewReader(upstreamBody)),
+		refreshErr:   errors.New("credential refresh temporarily unavailable"),
+	}
+	server.handlers.AuthManager.RegisterExecutor(executor)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/alpha/search", strings.NewReader(`{"model":"gpt-5-codex","query":"test"}`))
+	req.Header.Set("Authorization", "Bearer test-key")
+	recorder := httptest.NewRecorder()
+	server.engine.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusUnauthorized || recorder.Body.String() != upstreamBody {
+		t.Fatalf("response = %d %s, want original upstream 401 body", recorder.Code, recorder.Body.String())
+	}
+	if executor.refreshCalls != 1 || executor.httpCalls != 1 {
+		t.Fatalf("refresh/http calls = %d/%d, want 1/1", executor.refreshCalls, executor.httpCalls)
 	}
 }
 
