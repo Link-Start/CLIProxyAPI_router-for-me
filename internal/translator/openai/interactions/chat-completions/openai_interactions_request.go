@@ -205,7 +205,6 @@ func openAIChatImagePartToInteractions(part gjson.Result) []byte {
 func openAIToolResultToInteractions(message gjson.Result, forAntigravity bool) []byte {
 	out := []byte(`{"type":"function_result","result":""}`)
 	if callID := firstNonEmpty(message.Get("tool_call_id").String(), message.Get("id").String()); callID != "" {
-		out, _ = sjson.SetBytes(out, "id", callID)
 		out, _ = sjson.SetBytes(out, "call_id", callID)
 	}
 	if name := message.Get("name").String(); name != "" {

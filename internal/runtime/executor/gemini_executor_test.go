@@ -825,6 +825,71 @@ func TestGeminiExecutorNativeInteractionsTranslatesClaudeRequest(t *testing.T) {
 	}
 }
 
+func TestGeminiExecutorNativeInteractionsTranslatesClaudeToolResultDoesNotIncludeIDOnFunctionResult(t *testing.T) {
+	var gotPath string
+	var upstreamBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		body, errRead := io.ReadAll(r.Body)
+		if errRead != nil {
+			t.Fatalf("read request body: %v", errRead)
+		}
+		upstreamBody = body
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"interaction_1","object":"interaction","status":"completed","model":"gemini-3.1-flash-lite","steps":[{"type":"model_output","content":[{"type":"text","text":"ok"}]}],"usage":{"total_input_tokens":1,"total_output_tokens":1}}`))
+	}))
+	defer server.Close()
+
+	exec := NewGeminiInteractionsExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		Provider: "gemini-interactions",
+		Attributes: map[string]string{
+			"api_key":  "test-key",
+			"base_url": server.URL,
+		},
+	}
+	req := cliproxyexecutor.Request{
+		Model: "gemini-3.1-flash-lite",
+		Payload: []byte(`{
+			"model":"gemini-3.1-flash-lite",
+			"max_tokens":1024,
+			"messages":[
+				{"role":"assistant","content":[{"type":"tool_use","id":"toolu_123","name":"read_file","input":{"path":"/etc/hosts"}}]},
+				{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_123","content":"127.0.0.1 localhost"}]}
+			]
+		}`),
+	}
+
+	_, errExecute := exec.Execute(context.Background(), auth, req, cliproxyexecutor.Options{
+		SourceFormat:   sdktranslator.FormatClaude,
+		ResponseFormat: sdktranslator.FormatClaude,
+	})
+	if errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+	if gotPath != "/v1beta/interactions" {
+		t.Fatalf("path = %q, want /v1beta/interactions", gotPath)
+	}
+	if got := gjson.GetBytes(upstreamBody, "input.0.type").String(); got != "function_call" {
+		t.Fatalf("input.0.type = %q, want function_call. Body: %s", got, string(upstreamBody))
+	}
+	if got := gjson.GetBytes(upstreamBody, "input.0.id").String(); got != "toolu_123" {
+		t.Fatalf("input.0.id = %q, want toolu_123. Body: %s", got, string(upstreamBody))
+	}
+	if gjson.GetBytes(upstreamBody, "input.0.call_id").Exists() {
+		t.Fatalf("input.0.call_id must not exist on function_call, but got: %s", gjson.GetBytes(upstreamBody, "input.0.call_id").Raw)
+	}
+	if got := gjson.GetBytes(upstreamBody, "input.1.type").String(); got != "function_result" {
+		t.Fatalf("input.1.type = %q, want function_result. Body: %s", got, string(upstreamBody))
+	}
+	if got := gjson.GetBytes(upstreamBody, "input.1.call_id").String(); got != "toolu_123" {
+		t.Fatalf("input.1.call_id = %q, want toolu_123. Body: %s", got, string(upstreamBody))
+	}
+	if gjson.GetBytes(upstreamBody, "input.1.id").Exists() {
+		t.Fatalf("input.1.id must not exist on function_result, but got: %s", gjson.GetBytes(upstreamBody, "input.1.id").Raw)
+	}
+}
+
 func TestGeminiExecutorNativeInteractionsAppliesThinkingSuffix(t *testing.T) {
 	var upstreamBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
